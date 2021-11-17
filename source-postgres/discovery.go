@@ -4,76 +4,93 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
+	"strings"
 
-	"github.com/estuary/protocols/airbyte"
+	"github.com/estuary/connectors/sqlcapture"
+	"github.com/jackc/pgtype"
 	"github.com/jackc/pgx/v4"
 	"github.com/sirupsen/logrus"
 )
 
-// DiscoverCatalog queries the database and generates an Airbyte Catalog
-// describing the available tables and their columns.
-func DiscoverCatalog(ctx context.Context, config Config) (*airbyte.Catalog, error) {
-	var conn, err = pgx.Connect(ctx, config.ConnectionURI)
+// DiscoverTables queries the database to produce a list of all tables
+// (with the exception of some internal system schemas) with information
+// about their column types and primary key.
+func (db *postgresDatabase) DiscoverTables(ctx context.Context) (map[string]sqlcapture.TableInfo, error) {
+	// Get lists of all columns and primary keys in the database
+	var columns, err = getColumns(ctx, db.conn)
 	if err != nil {
-		return nil, fmt.Errorf("unable to connect to database: %w", err)
+		return nil, fmt.Errorf("unable to list database columns: %w", err)
 	}
-	defer conn.Close(ctx)
-
-	tables, err := getDatabaseTables(ctx, conn)
+	primaryKeys, err := getPrimaryKeys(ctx, db.conn)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("unable to list database primary keys: %w", err)
 	}
 
-	var catalog = new(airbyte.Catalog)
-	for _, table := range tables {
-		logrus.WithFields(logrus.Fields{
-			"table":      table.Name,
-			"namespace":  table.Schema,
-			"primaryKey": table.PrimaryKey,
-		}).Debug("discovered table")
-
-		var fields = make(map[string]json.RawMessage)
-		for _, column := range table.Columns {
-			var jsonType, ok = postgresTypeToJSON[column.DataType]
-			if !ok {
-				return nil, fmt.Errorf("cannot translate PostgreSQL column type %q to JSON schema", column.DataType)
-			}
-			if column.IsNullable && jsonType != "{}" {
-				jsonType = fmt.Sprintf(`{"anyOf":[%s,{"type":"null"}]}`, jsonType)
-			}
-			fields[column.Name] = json.RawMessage(jsonType)
+	// Aggregate column and primary key information into TableInfo structs
+	// using a map from fully-qualified "<schema>.<name>" table names to
+	// the corresponding TableInfo.
+	var tableMap = make(map[string]sqlcapture.TableInfo)
+	for _, column := range columns {
+		var id = column.TableSchema + "." + column.TableName
+		var info, ok = tableMap[id]
+		if !ok {
+			info = sqlcapture.TableInfo{Schema: column.TableSchema, Name: column.TableName}
 		}
-		var schema, err = json.Marshal(map[string]interface{}{
-			"type":       "object",
-			"required":   table.PrimaryKey,
-			"properties": fields,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("error marshalling schema JSON: %w", err)
-		}
-
-		logrus.WithFields(logrus.Fields{
-			"table":     table.Name,
-			"namespace": table.Schema,
-			"columns":   table.Columns,
-			"schema":    string(schema),
-		}).Debug("translated table schema")
-
-		var sourceDefinedPrimaryKey [][]string
-		for _, colName := range table.PrimaryKey {
-			sourceDefinedPrimaryKey = append(sourceDefinedPrimaryKey, []string{colName})
-		}
-
-		catalog.Streams = append(catalog.Streams, airbyte.Stream{
-			Name:                    table.Name,
-			Namespace:               table.Schema,
-			JSONSchema:              json.RawMessage(schema),
-			SupportedSyncModes:      airbyte.AllSyncModes,
-			SourceDefinedCursor:     true,
-			SourceDefinedPrimaryKey: sourceDefinedPrimaryKey,
-		})
+		info.Columns = append(info.Columns, column)
+		tableMap[id] = info
 	}
-	return catalog, err
+	for id, key := range primaryKeys {
+		// The `getColumns()` query implements the "exclude system schemas" logic,
+		// so here we ignore primary key information for tables we don't care about.
+		var info, ok = tableMap[id]
+		if !ok {
+			continue
+		}
+		logrus.WithField("table", id).WithField("key", key).Debug("queried primary key")
+		info.PrimaryKey = key
+		tableMap[id] = info
+	}
+	return tableMap, nil
+}
+
+// TranslateRecordField "translates" a value from the PostgreSQL driver into
+// an appropriate JSON-encodable output format. As a concrete example, the
+// PostgreSQL `cidr` type becomes a `*net.IPNet`, but the default JSON
+// marshalling of a `net.IPNet` isn't a great fit and we'd prefer to use
+// the `String()` method to get the usual "192.168.100.0/24" notation.
+func (db *postgresDatabase) TranslateRecordField(val interface{}) (interface{}, error) {
+	switch x := val.(type) {
+	case *net.IPNet:
+		return x.String(), nil
+	case net.HardwareAddr:
+		return x.String(), nil
+	case [16]uint8: // UUIDs
+		var s = new(strings.Builder)
+		for i := range x {
+			if i == 4 || i == 6 || i == 8 || i == 10 {
+				s.WriteString("-")
+			}
+			fmt.Fprintf(s, "%02x", x[i])
+		}
+		return s.String(), nil
+	}
+	if _, ok := val.(json.Marshaler); ok {
+		return val, nil
+	}
+	if enc, ok := val.(pgtype.TextEncoder); ok {
+		var bs, err = enc.EncodeText(nil, nil)
+		return string(bs), err
+	}
+	return val, nil
+}
+
+func (db *postgresDatabase) TranslateDBToJSONType(typeName string) (string, error) {
+	var jsonType, ok = postgresTypeToJSON[typeName]
+	if !ok {
+		return "", fmt.Errorf("unknown column type %q", jsonType)
+	}
+	return jsonType, nil
 }
 
 var postgresTypeToJSON = map[string]string{
@@ -130,69 +147,6 @@ var postgresTypeToJSON = map[string]string{
 	"uuid":        `{"type":"string","format":"uuid"}`,
 }
 
-// tableInfo represents all relevant knowledge about a PostgreSQL table.
-type tableInfo struct {
-	Name       string       // The PostgreSQL table name.
-	Schema     string       // The PostgreSQL schema (a namespace, in normal parlance) which contains the table.
-	Columns    []columnInfo // Information about each column of the table.
-	PrimaryKey []string     // An ordered list of the column names which together form the table's primary key.
-}
-
-// columnInfo represents a specific column of a specific table in PostgreSQL,
-// along with some information about its type.
-type columnInfo struct {
-	Name        string // The name of the column.
-	Index       int    // The ordinal position of this column in a row.
-	TableName   string // The name of the table to which this column belongs.
-	TableSchema string // The schema of the table to which this column belongs.
-	IsNullable  bool   // True if the column can contain nulls.
-	DataType    string // The PostgreSQL type name of this column.
-}
-
-// getDatabaseTables queries the database to produce a list of all tables
-// (with the exception of some internal system schemas) with information
-// about their column types and primary key.
-func getDatabaseTables(ctx context.Context, conn *pgx.Conn) ([]tableInfo, error) {
-	// Get lists of all columns and primary keys in the database
-	var columns, err = getColumns(ctx, conn)
-	if err != nil {
-		return nil, fmt.Errorf("unable to list database columns: %w", err)
-	}
-	primaryKeys, err := getPrimaryKeys(ctx, conn)
-	if err != nil {
-		return nil, fmt.Errorf("unable to list database primary keys: %w", err)
-	}
-
-	// Aggregate column and primary key information into TableInfo structs
-	// using a map from fully-qualified "<schema>.<name>" table names to
-	// the corresponding TableInfo.
-	var tableMap = make(map[string]*tableInfo)
-	for _, column := range columns {
-		var id = column.TableSchema + "." + column.TableName
-		if _, ok := tableMap[id]; !ok {
-			tableMap[id] = &tableInfo{Schema: column.TableSchema, Name: column.TableName}
-		}
-		tableMap[id].Columns = append(tableMap[id].Columns, column)
-	}
-	for id, key := range primaryKeys {
-		// The `getColumns()` query implements the "exclude system schemas" logic,
-		// so here we ignore primary key information for tables we don't care about.
-		if _, ok := tableMap[id]; !ok {
-			continue
-		}
-		logrus.WithField("table", id).WithField("key", key).Debug("queried primary key")
-		tableMap[id].PrimaryKey = key
-	}
-
-	// Now that aggregation is complete, discard map keys and return
-	// just the list of TableInfo structs.
-	var tables []tableInfo
-	for _, info := range tableMap {
-		tables = append(tables, *info)
-	}
-	return tables, nil
-}
-
 const queryDiscoverColumns = `
   SELECT table_schema, table_name, ordinal_position, column_name, is_nullable::boolean, udt_name
   FROM information_schema.columns
@@ -200,9 +154,9 @@ const queryDiscoverColumns = `
         AND table_schema != 'pg_internal' AND table_schema != 'catalog_history'
   ORDER BY table_schema, table_name, ordinal_position;`
 
-func getColumns(ctx context.Context, conn *pgx.Conn) ([]columnInfo, error) {
-	var columns []columnInfo
-	var sc columnInfo
+func getColumns(ctx context.Context, conn *pgx.Conn) ([]sqlcapture.ColumnInfo, error) {
+	var columns []sqlcapture.ColumnInfo
+	var sc sqlcapture.ColumnInfo
 	var _, err = conn.QueryFunc(ctx, queryDiscoverColumns, nil,
 		[]interface{}{&sc.TableSchema, &sc.TableName, &sc.Index, &sc.Name, &sc.IsNullable, &sc.DataType},
 		func(r pgx.QueryFuncRow) error {

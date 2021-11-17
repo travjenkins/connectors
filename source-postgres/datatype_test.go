@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/estuary/connectors/sqlcapture"
 	"github.com/estuary/protocols/airbyte"
 )
 
@@ -118,7 +119,7 @@ func TestDatatypes(t *testing.T) {
 
 			// Perform discovery and verify that the generated JSON schema looks correct
 			t.Run("discovery", func(t *testing.T) {
-				var discoveredCatalog, err = DiscoverCatalog(ctx, cfg)
+				var discoveredCatalog, err = sqlcapture.DiscoverCatalog(ctx, &postgresDatabase{config: &cfg})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -143,7 +144,7 @@ func TestDatatypes(t *testing.T) {
 
 			// Insert a test row and scan it back out, then do the same via replication
 			t.Run("roundtrip", func(t *testing.T) {
-				var catalog, state = testCatalog(table), PersistentState{}
+				var catalog, state = testCatalog(table), sqlcapture.PersistentState{}
 
 				t.Run("scan", func(t *testing.T) {
 					dbQuery(ctx, t, fmt.Sprintf(`INSERT INTO %s VALUES (1, %s);`, table, tc.ColumnValue))

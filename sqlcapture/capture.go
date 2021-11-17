@@ -1,33 +1,22 @@
-package main
+package sqlcapture
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/estuary/protocols/airbyte"
-	"github.com/jackc/pgconn"
-	"github.com/jackc/pglogrepl"
-	"github.com/jackc/pgtype"
-	"github.com/jackc/pgx/v4"
 	"github.com/sirupsen/logrus"
-)
-
-const (
-	defaultSchemaName = "public"
 )
 
 // PersistentState represents the part of a connector's state which can be serialized
 // and emitted in a state checkpoint, and resumed from after a restart.
 type PersistentState struct {
-	// The LSN (sequence number) from which replication should resume.
-	CurrentLSN pglogrepl.LSN `json:"current_lsn"`
-	// A mapping from table IDs (<namespace>.<table>) to table-sepcific state.
-	Streams map[string]*TableState `json:"streams"`
+	Cursor  string                `json:"cursor"`  // The replication cursor of the most recent 'Commit' event
+	Streams map[string]TableState `json:"streams"` // A mapping from table IDs (<namespace>.<table>) to table-sepcific state.
 }
 
 // Validate performs basic sanity-checking after a state has been parsed from JSON. More
@@ -36,12 +25,12 @@ func (ps *PersistentState) Validate() error {
 	return nil
 }
 
-// pendingStreams returns the IDs of all streams which still need to be backfilled,
-// in sorted order for test stability.
-func (ps *PersistentState) pendingStreams() []string {
+// PendingStreams returns the IDs of all streams which still need to be backfilled,
+// in sorted order for reproducibility.
+func (ps *PersistentState) PendingStreams() []string {
 	var pending []string
 	for id, tableState := range ps.Streams {
-		if tableState.Mode == tableModeBackfill {
+		if tableState.Mode == TableModeBackfill {
 			pending = append(pending, id)
 		}
 	}
@@ -64,94 +53,95 @@ type TableState struct {
 	Scanned []byte `json:"scanned,omitempty"`
 }
 
+// The table's mode can be one of:
+//   Backfill: The table's rows are being backfilled and replication events will only be emitted for the already-backfilled portion.
+//   Active: The table finished backfilling and replication events are emitted for the entire table.
+//   Ignore: The table is being deliberately ignored.
 const (
-	tableModeBackfill = "Backfill"
-	tableModeActive   = "Active"
-	tableModeIgnore   = "Ignore"
+	TableModeIgnore   = "Ignore"
+	TableModeBackfill = "Backfill"
+	TableModeActive   = "Active"
 )
 
-// capture encapsulates the entire process of capturing data from PostgreSQL with a particular
-// configuration/catalog/state and emitting records and state updates to some messageOutput.
-type capture struct {
-	state   *PersistentState           // State read from `state.json` and emitted as updates
-	config  *Config                    // The configuration read from `config.json`
-	catalog *airbyte.ConfiguredCatalog // The catalog read from `catalog.json`
-	encoder messageOutput              // The encoder to which records and state updates are written
-
-	connScan   *pgx.Conn          // The DB connection used for table scanning
-	replStream *replicationStream // The high-level replication stream abstraction
-}
-
-// messageOutput represents "the thing to which Capture writes records and state checkpoints".
-// A json.Encoder satisfies this interface in normal usage, but during tests a custom messageOutput
+// MessageOutput represents "the thing to which Capture writes records and state checkpoints".
+// A json.Encoder satisfies this interface in normal usage, but during tests a custom MessageOutput
 // is used which collects output in memory.
-type messageOutput interface {
+type MessageOutput interface {
 	Encode(v interface{}) error
 }
 
-// RunCapture is the top level of the database capture process. It  is responsible for opening DB
-// connections, scanning tables, and then streaming replication events until shutdown conditions
-// (if any) are met.
-func RunCapture(ctx context.Context, config *Config, catalog *airbyte.ConfiguredCatalog, state *PersistentState, dest messageOutput) error {
-	logrus.WithField("uri", config.ConnectionURI).WithField("slot", config.SlotName).Info("starting capture")
+// Capture encapsulates the generic process of capturing data from a SQL database
+// via replication, backfilling preexisting table contents, and emitting records/state
+// updates. It uses the `Database` interface to interact with a specific database.
+type Capture struct {
+	Catalog  *airbyte.ConfiguredCatalog // The catalog read from `catalog.json`
+	State    *PersistentState           // State read from `state.json` and emitted as updates
+	Encoder  MessageOutput              // The encoder to which records and state updates are written
+	Database Database                   // The database-specific interface which is operated by the generic Capture logic
+}
 
-	// Normal database connection used for table scanning
-	var connScan, err = pgx.Connect(ctx, config.ConnectionURI)
+// Run is the top level entry point of the capture process.
+func (c *Capture) Run(ctx context.Context) error {
+	var replStream, err = c.Database.StartReplication(ctx, c.State.Cursor)
 	if err != nil {
-		return fmt.Errorf("unable to connect to database for table scan: %w", err)
-	}
-	defer connScan.Close(ctx)
-
-	// Replication database connection used for event streaming
-	replConnConfig, err := pgconn.ParseConfig(config.ConnectionURI)
-	if err != nil {
-		return err
-	}
-	replConnConfig.RuntimeParams["replication"] = "database"
-	connRepl, err := pgconn.ConnectConfig(ctx, replConnConfig)
-	if err != nil {
-		return fmt.Errorf("unable to connect to database for replication: %w", err)
-	}
-	replStream, err := startReplication(ctx, connRepl, config.SlotName, config.PublicationName, state.CurrentLSN)
-	if err != nil {
-		return fmt.Errorf("unable to start replication stream: %w", err)
+		return fmt.Errorf("error starting replication: %w", err)
 	}
 	defer replStream.Close(ctx)
-
-	var c = &capture{
-		state:      state,
-		config:     config,
-		catalog:    catalog,
-		encoder:    dest,
-		connScan:   connScan,
-		replStream: replStream,
-	}
 
 	if err := c.updateState(ctx); err != nil {
 		return fmt.Errorf("error updating capture state: %w", err)
 	}
 
-	return c.streamChanges(ctx)
+	// Backfill any tables which require it
+	var results *resultSet
+	for c.State.PendingStreams() != nil {
+		watermark, err := c.Database.WriteWatermark(ctx)
+		if err != nil {
+			return fmt.Errorf("error writing next watermark: %w", err)
+		}
+		if err := c.streamToWatermark(replStream, watermark, results); err != nil {
+			return fmt.Errorf("error streaming until watermark: %w", err)
+		} else if err := c.emitBuffered(results); err != nil {
+			return fmt.Errorf("error emitting buffered results: %w", err)
+		}
+		results, err = c.backfillStreams(ctx, c.State.PendingStreams())
+		if err != nil {
+			return fmt.Errorf("error performing backfill: %w", err)
+		}
+	}
+
+	// Once there is no more backfilling to do, just stream changes forever and emit
+	// state updates on every transaction commit.
+	var targetWatermark = "nonexistent-watermark"
+	if !c.Catalog.Tail {
+		var watermark, err = c.Database.WriteWatermark(ctx)
+		if err != nil {
+			return fmt.Errorf("error writing poll watermark: %w", err)
+		}
+		targetWatermark = watermark
+	}
+	logrus.WithField("tail", c.Catalog.Tail).WithField("watermark", targetWatermark).Info("streaming until watermark")
+	return c.streamToWatermark(replStream, targetWatermark, nil)
 }
 
-func (c *capture) updateState(ctx context.Context) error {
+func (c *Capture) updateState(ctx context.Context) error {
 	var stateDirty = false
 
 	// Create the Streams map if nil
-	if c.state.Streams == nil {
-		c.state.Streams = make(map[string]*TableState)
+	if c.State.Streams == nil {
+		c.State.Streams = make(map[string]TableState)
 		stateDirty = true
 	}
 
 	// Streams may be added to the catalog at various times. We need to
 	// initialize new state entries for these streams, and while we're at
 	// it this is a good time to sanity-check the primary key configuration.
-	var dbPrimaryKeys, err = getPrimaryKeys(ctx, c.connScan)
+	var dbTables, err = c.Database.DiscoverTables(ctx)
 	if err != nil {
-		return fmt.Errorf("error querying database about primary keys: %w", err)
+		return fmt.Errorf("error discovering database tables: %w", err)
 	}
 
-	for _, catalogStream := range c.catalog.Streams {
+	for _, catalogStream := range c.Catalog.Streams {
 		var streamID = joinStreamID(catalogStream.Stream.Namespace, catalogStream.Stream.Name)
 
 		// In the catalog a primary key is an array of arrays of strings, but in the
@@ -168,7 +158,7 @@ func (c *capture) updateState(ctx context.Context) error {
 		// If the `PrimaryKey` property is specified in the catalog then use that,
 		// otherwise use the "native" primary key of this table in the database.
 		// Print a warning if the two are not the same.
-		var primaryKey = dbPrimaryKeys[streamID]
+		var primaryKey = dbTables[streamID].PrimaryKey
 		if len(primaryKey) != 0 {
 			logrus.WithField("table", streamID).WithField("key", primaryKey).Debug("queried primary key")
 		}
@@ -187,9 +177,9 @@ func (c *capture) updateState(ctx context.Context) error {
 		}
 
 		// See if the stream is already initialized. If it's not, then create it.
-		var streamState, ok = c.state.Streams[streamID]
+		var streamState, ok = c.State.Streams[streamID]
 		if !ok {
-			c.state.Streams[streamID] = &TableState{Mode: tableModeBackfill, KeyColumns: primaryKey}
+			c.State.Streams[streamID] = TableState{Mode: TableModeBackfill, KeyColumns: primaryKey}
 			stateDirty = true
 			continue
 		}
@@ -201,10 +191,10 @@ func (c *capture) updateState(ctx context.Context) error {
 
 	// Likewise streams may be removed from the catalog, and we need to forget
 	// the corresponding state information.
-	for streamID := range c.state.Streams {
+	for streamID := range c.State.Streams {
 		// List membership checks are always a pain in Go, but that's all this loop is
 		var streamExistsInCatalog = false
-		for _, catalogStream := range c.catalog.Streams {
+		for _, catalogStream := range c.Catalog.Streams {
 			var catalogStreamID = joinStreamID(catalogStream.Stream.Namespace, catalogStream.Stream.Name)
 			if streamID == catalogStreamID {
 				streamExistsInCatalog = true
@@ -213,7 +203,7 @@ func (c *capture) updateState(ctx context.Context) error {
 
 		if !streamExistsInCatalog {
 			logrus.WithField("stream", streamID).Info("stream removed from catalog")
-			delete(c.state.Streams, streamID)
+			delete(c.State.Streams, streamID)
 			stateDirty = true
 		}
 	}
@@ -221,53 +211,19 @@ func (c *capture) updateState(ctx context.Context) error {
 	// If we've altered the state, emit it to stdout. This isn't strictly necessary
 	// but it helps to make the emitted sequence of state updates a lot more readable.
 	if stateDirty {
-		c.emitState(c.state)
+		c.emitState()
 	}
 	return nil
 }
 
-// This is the main loop of the capture process, which interleaves replication event
-// streaming with backfill scan results as necessary.
-func (c *capture) streamChanges(ctx context.Context) error {
-	var results *resultSet
-	for c.state.pendingStreams() != nil {
-		watermark, err := writeWatermark(ctx, c.connScan, c.config.WatermarksTable, c.config.SlotName)
-		if err != nil {
-			return fmt.Errorf("error writing next watermark: %w", err)
-		}
-		if err := c.streamToWatermark(watermark, results); err != nil {
-			return fmt.Errorf("error streaming until watermark: %w", err)
-		} else if err := c.emitBuffered(results); err != nil {
-			return fmt.Errorf("error emitting buffered results: %w", err)
-		}
-		results, err = c.backfillStreams(ctx, c.state.pendingStreams())
-		if err != nil {
-			return fmt.Errorf("error performing backfill: %w", err)
-		}
-	}
-
-	// Once there is no more backfilling to do, just stream changes forever and emit
-	// state updates on every transaction commit.
-	var targetWatermark = "nonexistent-watermark"
-	if !c.catalog.Tail {
-		var watermark, err = writeWatermark(ctx, c.connScan, c.config.WatermarksTable, c.config.SlotName)
-		if err != nil {
-			return fmt.Errorf("error writing poll watermark: %w", err)
-		}
-		targetWatermark = watermark
-	}
-	logrus.WithField("tail", c.catalog.Tail).WithField("watermark", targetWatermark).Info("streaming until watermark")
-	return c.streamToWatermark(targetWatermark, nil)
-}
-
-func (c *capture) streamToWatermark(watermark string, results *resultSet) error {
+func (c *Capture) streamToWatermark(replStream ReplicationStream, watermark string, results *resultSet) error {
 	var watermarkReached = false
-	for event := range c.replStream.Events() {
-		// Commit events update the current LSN and trigger a state update. If this is
+	for event := range replStream.Events() {
+		// Commit events update the cursor and trigger a state update. If this is
 		// the commit after the target watermark, it also ends the loop.
 		if event.Type == "Commit" {
-			c.state.CurrentLSN = event.LSN
-			if err := c.emitState(c.state); err != nil {
+			c.State.Cursor = event.Cursor
+			if err := c.emitState(); err != nil {
 				return fmt.Errorf("error emitting state update: %w", err)
 			}
 			if watermarkReached {
@@ -279,7 +235,7 @@ func (c *capture) streamToWatermark(watermark string, results *resultSet) error 
 		// Note when the expected watermark is finally observed. The subsequent Commit will exit the loop.
 		// TODO(wgd): Can we ensure/require that 'WatermarksTable' is always fully-qualified?
 		var streamID = joinStreamID(event.Namespace, event.Table)
-		if streamID == c.config.WatermarksTable {
+		if streamID == c.Database.WatermarksTable() {
 			logrus.WithFields(logrus.Fields{"expected": watermark, "written": event.Fields["watermark"]}).Debug("watermark write")
 			if event.Fields["watermark"] == watermark {
 				watermarkReached = true
@@ -287,18 +243,18 @@ func (c *capture) streamToWatermark(watermark string, results *resultSet) error 
 		}
 
 		// Handle the easy cases: Events on ignored or fully-active tables.
-		var tableState = c.state.Streams[streamID]
-		if tableState == nil || tableState.Mode == tableModeIgnore {
+		var tableState = c.State.Streams[streamID]
+		if tableState.Mode == "" || tableState.Mode == TableModeIgnore {
 			logrus.WithFields(logrus.Fields{"stream": streamID, "type": event.Type}).Debug("ignoring stream")
 			continue
 		}
-		if tableState.Mode == tableModeActive {
+		if tableState.Mode == TableModeActive {
 			if err := c.handleChangeEvent(event); err != nil {
 				return fmt.Errorf("error handling replication event: %w", err)
 			}
 			continue
 		}
-		if tableState.Mode != tableModeBackfill {
+		if tableState.Mode != TableModeBackfill {
 			return fmt.Errorf("table %q in invalid mode %q", streamID, tableState.Mode)
 		}
 
@@ -320,7 +276,7 @@ func (c *capture) streamToWatermark(watermark string, results *resultSet) error 
 	return nil
 }
 
-func (c *capture) emitBuffered(results *resultSet) error {
+func (c *Capture) emitBuffered(results *resultSet) error {
 	// Emit any buffered results and update table states accordingly.
 	for _, streamID := range results.Streams() {
 		var events = results.Changes(streamID)
@@ -330,21 +286,23 @@ func (c *capture) emitBuffered(results *resultSet) error {
 			}
 		}
 
+		var state = c.State.Streams[streamID]
 		if results.Complete(streamID) {
-			c.state.Streams[streamID].Mode = tableModeActive
-			c.state.Streams[streamID].Scanned = nil
+			state.Mode = TableModeActive
+			state.Scanned = nil
 		} else {
-			c.state.Streams[streamID].Scanned = results.Scanned(streamID)
+			state.Scanned = results.Scanned(streamID)
 		}
+		c.State.Streams[streamID] = state
 	}
 
 	// Emit a new state update. The global `CurrentLSN` has been advanced by the
 	// watermark commit event, and the individual stream `Scanned` tracking for
 	// each stream has been advanced just above.
-	return c.emitState(c.state)
+	return c.emitState()
 }
 
-func (c *capture) backfillStreams(ctx context.Context, streams []string) (*resultSet, error) {
+func (c *Capture) backfillStreams(ctx context.Context, streams []string) (*resultSet, error) {
 	var results = newResultSet()
 
 	// TODO(wgd): Add a sanity-check assertion that the current watermark value
@@ -354,10 +312,21 @@ func (c *capture) backfillStreams(ctx context.Context, streams []string) (*resul
 	// TODO(wgd): We can dispatch these table reads concurrently with a WaitGroup
 	// for synchronization.
 	for _, streamID := range streams {
-		var streamState = c.state.Streams[streamID]
+		var streamState = c.State.Streams[streamID]
 
 		// Fetch a chunk of entries from the specified stream
-		var events, err = scanTableChunk(ctx, c.connScan, streamID, streamState.KeyColumns, streamState.Scanned)
+		var err error
+		var resumeKey []interface{}
+		if streamState.Scanned != nil {
+			resumeKey, err = unpackTuple(streamState.Scanned)
+			if err != nil {
+				return nil, fmt.Errorf("error unpacking resume key: %w", err)
+			}
+			if len(resumeKey) != len(streamState.KeyColumns) {
+				return nil, fmt.Errorf("expected %d resume-key values but got %d", len(streamState.KeyColumns), len(resumeKey))
+			}
+		}
+		events, err := c.Database.ScanTableChunk(ctx, streamID, streamState.KeyColumns, resumeKey)
 		if err != nil {
 			return nil, fmt.Errorf("error scanning table: %w", err)
 		}
@@ -370,11 +339,11 @@ func (c *capture) backfillStreams(ctx context.Context, streams []string) (*resul
 	return results, nil
 }
 
-func (c *capture) handleChangeEvent(event *changeEvent) error {
+func (c *Capture) handleChangeEvent(event ChangeEvent) error {
 	event.Fields["_change_type"] = event.Type
 
 	for id, val := range event.Fields {
-		var translated, err = translateRecordField(val)
+		var translated, err = c.Database.TranslateRecordField(val)
 		if err != nil {
 			logrus.WithField("val", val).Error("value translation error")
 			return fmt.Errorf("error translating field %q value: %w", id, err)
@@ -384,43 +353,12 @@ func (c *capture) handleChangeEvent(event *changeEvent) error {
 	return c.emitRecord(event.Namespace, event.Table, event.Fields)
 }
 
-// TranslateRecordField "translates" a value from the PostgreSQL driver into
-// an appropriate JSON-encodable output format. As a concrete example, the
-// PostgreSQL `cidr` type becomes a `*net.IPNet`, but the default JSON
-// marshalling of a `net.IPNet` isn't a great fit and we'd prefer to use
-// the `String()` method to get the usual "192.168.100.0/24" notation.
-func translateRecordField(val interface{}) (interface{}, error) {
-	switch x := val.(type) {
-	case *net.IPNet:
-		return x.String(), nil
-	case net.HardwareAddr:
-		return x.String(), nil
-	case [16]uint8: // UUIDs
-		var s = new(strings.Builder)
-		for i := range x {
-			if i == 4 || i == 6 || i == 8 || i == 10 {
-				s.WriteString("-")
-			}
-			fmt.Fprintf(s, "%02x", x[i])
-		}
-		return s.String(), nil
-	}
-	if _, ok := val.(json.Marshaler); ok {
-		return val, nil
-	}
-	if enc, ok := val.(pgtype.TextEncoder); ok {
-		var bs, err = enc.EncodeText(nil, nil)
-		return string(bs), err
-	}
-	return val, nil
-}
-
-func (c *capture) emitRecord(ns, stream string, data interface{}) error {
+func (c *Capture) emitRecord(ns, stream string, data interface{}) error {
 	var rawData, err = json.Marshal(data)
 	if err != nil {
 		return fmt.Errorf("error encoding record data: %w", err)
 	}
-	return c.emit(airbyte.Message{
+	return c.Encoder.Encode(airbyte.Message{
 		Type: airbyte.MessageTypeRecord,
 		Record: &airbyte.Record{
 			Namespace: ns,
@@ -431,20 +369,18 @@ func (c *capture) emitRecord(ns, stream string, data interface{}) error {
 	})
 }
 
-func (c *capture) emitState(state interface{}) error {
-	var rawState, err = json.Marshal(state)
+func (c *Capture) emitState() error {
+	var rawState, err = json.Marshal(c.State)
 	if err != nil {
 		return fmt.Errorf("error encoding state message: %w", err)
 	}
-	return c.emit(airbyte.Message{
+	return c.Encoder.Encode(airbyte.Message{
 		Type:  airbyte.MessageTypeState,
 		State: &airbyte.State{Data: json.RawMessage(rawState)},
 	})
 }
 
-func (c *capture) emit(msg interface{}) error {
-	return c.encoder.Encode(msg)
-}
+const defaultSchemaName = "public"
 
 // joinStreamID combines a namespace and a stream name into a fully-qualified
 // stream (or table) identifier. Because it's possible for the namespace to be

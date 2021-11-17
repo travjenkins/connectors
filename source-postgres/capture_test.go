@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/estuary/connectors/sqlcapture"
 	"github.com/jackc/pglogrepl"
 	"github.com/sirupsen/logrus"
 )
@@ -16,7 +17,7 @@ import (
 func TestSimpleCapture(t *testing.T) {
 	var cfg, ctx = TestDefaultConfig, shortTestContext(t)
 	var tableName = createTestTable(ctx, t, "", "(id INTEGER PRIMARY KEY, data TEXT)")
-	var catalog, state = testCatalog(tableName), PersistentState{}
+	var catalog, state = testCatalog(tableName), sqlcapture.PersistentState{}
 
 	// Add data, perform capture, verify result
 	dbInsert(ctx, t, tableName, [][]interface{}{{0, "A"}, {1, "bbb"}, {2, "CDEFGHIJKLMNOP"}, {3, "Four"}, {4, "5"}})
@@ -30,7 +31,7 @@ func TestSimpleCapture(t *testing.T) {
 func TestTailing(t *testing.T) {
 	var cfg, ctx = TestDefaultConfig, shortTestContext(t)
 	var tableName = createTestTable(ctx, t, "", "(id INTEGER PRIMARY KEY, data TEXT)")
-	var catalog, state = testCatalog(tableName), PersistentState{}
+	var catalog, state = testCatalog(tableName), sqlcapture.PersistentState{}
 	catalog.Tail = true
 
 	// Initial data which must be backfilled
@@ -57,7 +58,7 @@ func TestTailing(t *testing.T) {
 func TestReplicationInserts(t *testing.T) {
 	var cfg, ctx = TestDefaultConfig, shortTestContext(t)
 	var tableName = createTestTable(ctx, t, "", "(id INTEGER PRIMARY KEY, data TEXT)")
-	var catalog, state = testCatalog(tableName), PersistentState{}
+	var catalog, state = testCatalog(tableName), sqlcapture.PersistentState{}
 
 	dbInsert(ctx, t, tableName, [][]interface{}{{0, "A"}, {1, "bbb"}, {2, "CDEFGHIJKLMNOP"}, {3, "Four"}, {4, "5"}})
 	verifiedCapture(ctx, t, &cfg, &catalog, &state, "init")
@@ -71,7 +72,7 @@ func TestReplicationInserts(t *testing.T) {
 func TestReplicationDeletes(t *testing.T) {
 	var cfg, ctx = TestDefaultConfig, shortTestContext(t)
 	var tableName = createTestTable(ctx, t, "", "(id INTEGER PRIMARY KEY, data TEXT)")
-	var catalog, state = testCatalog(tableName), PersistentState{}
+	var catalog, state = testCatalog(tableName), sqlcapture.PersistentState{}
 
 	dbInsert(ctx, t, tableName, [][]interface{}{{0, "A"}, {1, "bbb"}, {2, "CDEFGHIJKLMNOP"}, {3, "Four"}, {4, "5"}})
 	verifiedCapture(ctx, t, &cfg, &catalog, &state, "init")
@@ -86,7 +87,7 @@ func TestReplicationDeletes(t *testing.T) {
 func TestReplicationUpdates(t *testing.T) {
 	var cfg, ctx = TestDefaultConfig, shortTestContext(t)
 	var tableName = createTestTable(ctx, t, "", "(id INTEGER PRIMARY KEY, data TEXT)")
-	var catalog, state = testCatalog(tableName), PersistentState{}
+	var catalog, state = testCatalog(tableName), sqlcapture.PersistentState{}
 
 	dbInsert(ctx, t, tableName, [][]interface{}{{0, "A"}, {1, "bbb"}, {2, "CDEFGHIJKLMNOP"}})
 	verifiedCapture(ctx, t, &cfg, &catalog, &state, "init")
@@ -100,7 +101,7 @@ func TestReplicationUpdates(t *testing.T) {
 func TestEmptyTable(t *testing.T) {
 	var cfg, ctx = TestDefaultConfig, shortTestContext(t)
 	var tableName = createTestTable(ctx, t, "", "(id INTEGER PRIMARY KEY, data TEXT)")
-	var catalog, state = testCatalog(tableName), PersistentState{}
+	var catalog, state = testCatalog(tableName), sqlcapture.PersistentState{}
 
 	verifiedCapture(ctx, t, &cfg, &catalog, &state, "init")
 	dbInsert(ctx, t, tableName, [][]interface{}{{1002, "some"}, {1000, "more"}, {1001, "rows"}})
@@ -115,7 +116,7 @@ func TestEmptyTable(t *testing.T) {
 func TestComplexDataset(t *testing.T) {
 	var cfg, ctx = TestDefaultConfig, shortTestContext(t)
 	var tableName = createTestTable(ctx, t, "", "(year INTEGER, state TEXT, fullname TEXT, population INTEGER, PRIMARY KEY (year, state))")
-	var catalog, state = testCatalog(tableName), PersistentState{}
+	var catalog, state = testCatalog(tableName), sqlcapture.PersistentState{}
 
 	dbLoadCSV(ctx, t, tableName, "statepop.csv", 0)
 	var states = verifiedCapture(ctx, t, &cfg, &catalog, &state, "init")
@@ -141,7 +142,7 @@ func TestComplexDataset(t *testing.T) {
 // TestMultipleStreams exercises captures with multiple stream configured, as
 // well as adding/removing/re-adding a stream.
 func TestMultipleStreams(t *testing.T) {
-	var cfg, ctx, state = TestDefaultConfig, shortTestContext(t), PersistentState{}
+	var cfg, ctx, state = TestDefaultConfig, shortTestContext(t), sqlcapture.PersistentState{}
 	var table1 = createTestTable(ctx, t, "one", "(id INTEGER PRIMARY KEY, data TEXT)")
 	var table2 = createTestTable(ctx, t, "two", "(id INTEGER PRIMARY KEY, data TEXT)")
 	var table3 = createTestTable(ctx, t, "three", "(id INTEGER PRIMARY KEY, data TEXT)")
@@ -164,7 +165,7 @@ func TestMultipleStreams(t *testing.T) {
 // TestCatalogPrimaryKey sets up a table with no primary key in the database
 // and instead specifies one in the catalog configuration.
 func TestCatalogPrimaryKey(t *testing.T) {
-	var cfg, ctx, state = TestDefaultConfig, shortTestContext(t), PersistentState{}
+	var cfg, ctx, state = TestDefaultConfig, shortTestContext(t), sqlcapture.PersistentState{}
 	var table = createTestTable(ctx, t, "", "(year INTEGER, state TEXT, fullname TEXT, population INTEGER)")
 	dbLoadCSV(ctx, t, table, "statepop.csv", 100)
 	var catalog = testCatalog(table)
@@ -181,7 +182,7 @@ func TestCatalogPrimaryKey(t *testing.T) {
 // TestCatalogPrimaryKeyOverride sets up a table with a primary key, but
 // then overrides that via the catalog configuration.
 func TestCatalogPrimaryKeyOverride(t *testing.T) {
-	var cfg, ctx, state = TestDefaultConfig, shortTestContext(t), PersistentState{}
+	var cfg, ctx, state = TestDefaultConfig, shortTestContext(t), sqlcapture.PersistentState{}
 	var table = createTestTable(ctx, t, "", "(year INTEGER, state TEXT, fullname TEXT, population INTEGER, PRIMARY KEY (year, state))")
 	dbLoadCSV(ctx, t, table, "statepop.csv", 100)
 	var catalog = testCatalog(table)
@@ -198,7 +199,7 @@ func TestCatalogPrimaryKeyOverride(t *testing.T) {
 // TestIgnoredStreams checks that replicated changes are only reported
 // for tables which are configured in the catalog.
 func TestIgnoredStreams(t *testing.T) {
-	var cfg, ctx, state = TestDefaultConfig, shortTestContext(t), PersistentState{}
+	var cfg, ctx, state = TestDefaultConfig, shortTestContext(t), sqlcapture.PersistentState{}
 	var table1 = createTestTable(ctx, t, "one", "(id INTEGER PRIMARY KEY, data TEXT)")
 	var table2 = createTestTable(ctx, t, "two", "(id INTEGER PRIMARY KEY, data TEXT)")
 	dbInsert(ctx, t, table1, [][]interface{}{{0, "zero"}, {1, "one"}, {2, "two"}})
@@ -219,7 +220,7 @@ func TestSlotLSNAdvances(t *testing.T) {
 		t.Skip("skipping test in short mode.")
 	}
 
-	var cfg, ctx, state = TestDefaultConfig, longTestContext(t, 60*time.Second), PersistentState{}
+	var cfg, ctx, state = TestDefaultConfig, longTestContext(t, 60*time.Second), sqlcapture.PersistentState{}
 	var table = createTestTable(ctx, t, "one", "(id INTEGER PRIMARY KEY, data TEXT)")
 	var catalog = testCatalog(table)
 

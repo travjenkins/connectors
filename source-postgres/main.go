@@ -4,13 +4,21 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 
+	"github.com/estuary/connectors/sqlcapture"
 	"github.com/estuary/protocols/airbyte"
+	"github.com/jackc/pgx/v4"
+	"github.com/sirupsen/logrus"
 )
 
 func main() {
-	airbyte.RunMain(spec, doCheck, doDiscover, doRead)
+	sqlcapture.AirbyteMain(spec, func(configFile airbyte.ConfigFile) (sqlcapture.Database, error) {
+		var config Config
+		if err := configFile.Parse(&config); err != nil {
+			return nil, fmt.Errorf("error parsing config file: %w", err)
+		}
+		return &postgresDatabase{config: &config}, nil
+	})
 }
 
 // Config tells the connector how to connect to the source database and can
@@ -78,56 +86,29 @@ const configSchema = `{
 	"required": [ "connectionURI" ]
 }`
 
-func doCheck(args airbyte.CheckCmd) error {
-	var config Config
-	if err := args.ConfigFile.Parse(&config); err != nil {
-		return err
-	}
-	var result = &airbyte.ConnectionStatus{Status: airbyte.StatusSucceeded}
-	if _, err := DiscoverCatalog(context.Background(), config); err != nil {
-		result.Status = airbyte.StatusFailed
-		result.Message = err.Error()
-	}
-	return airbyte.NewStdoutEncoder().Encode(airbyte.Message{
-		Type:             airbyte.MessageTypeConnectionStatus,
-		ConnectionStatus: result,
-	})
+type postgresDatabase struct {
+	config *Config
+	conn   *pgx.Conn
 }
 
-func doDiscover(args airbyte.DiscoverCmd) error {
-	var config Config
-	if err := args.ConfigFile.Parse(&config); err != nil {
-		return err
-	}
-	var catalog, err = DiscoverCatalog(context.Background(), config)
+func (db *postgresDatabase) Connect(ctx context.Context) error {
+	logrus.WithFields(logrus.Fields{
+		"uri":  db.config.ConnectionURI,
+		"slot": db.config.SlotName,
+	}).Info("initializing connector")
+
+	// Normal database connection used for table scanning
+	var conn, err = pgx.Connect(ctx, db.config.ConnectionURI)
 	if err != nil {
-		return err
+		return fmt.Errorf("unable to connect to database: %w", err)
 	}
-	return airbyte.NewStdoutEncoder().Encode(airbyte.Message{
-		Type:    airbyte.MessageTypeCatalog,
-		Catalog: catalog,
-	})
+	db.conn = conn
+	return nil
 }
 
-func doRead(args airbyte.ReadCmd) error {
-	var ctx = context.Background()
-
-	var state = &PersistentState{Streams: make(map[string]*TableState)}
-	if args.StateFile != "" {
-		if err := args.StateFile.Parse(state); err != nil {
-			return fmt.Errorf("unable to parse state file: %w", err)
-		}
+func (db *postgresDatabase) Close(ctx context.Context) error {
+	if err := db.conn.Close(ctx); err != nil {
+		return fmt.Errorf("error closing database connection: %w", err)
 	}
-
-	var config = new(Config)
-	if err := args.ConfigFile.Parse(config); err != nil {
-		return err
-	}
-
-	var catalog = new(airbyte.ConfiguredCatalog)
-	if err := args.CatalogFile.Parse(catalog); err != nil {
-		return fmt.Errorf("unable to parse catalog: %w", err)
-	}
-
-	return RunCapture(ctx, config, catalog, state, json.NewEncoder(os.Stdout))
+	return nil
 }

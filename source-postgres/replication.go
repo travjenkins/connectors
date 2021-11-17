@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/estuary/connectors/sqlcapture"
 	"github.com/jackc/pgconn"
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgproto3/v2"
@@ -14,14 +15,24 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-type changeEventHandler func(event *changeEvent) error
+func (db *postgresDatabase) StartReplication(ctx context.Context, startCursor string) (sqlcapture.ReplicationStream, error) {
+	// Replication database connection used for event streaming
+	replConnConfig, err := pgconn.ParseConfig(db.config.ConnectionURI)
+	if err != nil {
+		return nil, err
+	}
+	replConnConfig.RuntimeParams["replication"] = "database"
+	replConn, err := pgconn.ConnectConfig(ctx, replConnConfig)
+	if err != nil {
+		return nil, fmt.Errorf("unable to connect to database for replication: %w", err)
+	}
 
-type changeEvent struct {
-	Type      string
-	LSN       pglogrepl.LSN // Only set for "Commit" events
-	Namespace string
-	Table     string
-	Fields    map[string]interface{}
+	startLSN, err := pglogrepl.ParseLSN(startCursor)
+	if err != nil && startCursor != "" {
+		return nil, fmt.Errorf("error parsing start cursor: %w", err)
+	}
+
+	return startReplication(ctx, replConn, db.config.SlotName, db.config.PublicationName, startLSN)
 }
 
 // A replicationStream represents the process of receiving PostgreSQL
@@ -51,8 +62,8 @@ type replicationStream struct {
 
 	inTransaction bool // inTransaction is true when we're in between a BEGIN/COMMIT message pair.
 
-	eventBuf *changeEvent      // A single-element buffer used in between 'receiveMessage' and the output channel
-	events   chan *changeEvent // The channel to which replication events will be written
+	eventBuf *sqlcapture.ChangeEvent     // A single-element buffer used in between 'receiveMessage' and the output channel
+	events   chan sqlcapture.ChangeEvent // The channel to which replication events will be written
 
 	cancel context.CancelFunc // Cancel function for the replication goroutine's context
 }
@@ -90,7 +101,7 @@ func startReplication(ctx context.Context, conn *pgconn.PgConn, slot, publicatio
 		connInfo:  pgtype.NewConnInfo(),
 		relations: make(map[uint32]*pglogrepl.RelationMessage),
 		// standbyStatusDeadline is left uninitialized so an update will be sent ASAP
-		events: make(chan *changeEvent, replicationBufferSize),
+		events: make(chan sqlcapture.ChangeEvent, replicationBufferSize),
 	}
 
 	// Create the publication and replication slot, ignoring the inevitable errors
@@ -122,7 +133,7 @@ func startReplication(ctx context.Context, conn *pgconn.PgConn, slot, publicatio
 	return stream, nil
 }
 
-func (s *replicationStream) Events() <-chan *changeEvent {
+func (s *replicationStream) Events() <-chan sqlcapture.ChangeEvent {
 	return s.events
 }
 
@@ -164,7 +175,7 @@ func (s *replicationStream) relayMessages(ctx context.Context) error {
 			select {
 			case <-ctx.Done():
 				return nil
-			case s.events <- s.eventBuf:
+			case s.events <- *s.eventBuf:
 				s.eventBuf = nil
 			}
 		}
@@ -189,7 +200,7 @@ func (s *replicationStream) relayMessages(ctx context.Context) error {
 	}
 }
 
-func (s *replicationStream) decodeMessage(msg pglogrepl.Message) (*changeEvent, error) {
+func (s *replicationStream) decodeMessage(msg pglogrepl.Message) (*sqlcapture.ChangeEvent, error) {
 	// Some notes on the Logical Replication / pgoutput message stream, since
 	// as far as I can tell this isn't documented anywhere but comments in the
 	// relevant PostgreSQL sources.
@@ -233,9 +244,9 @@ func (s *replicationStream) decodeMessage(msg pglogrepl.Message) (*changeEvent, 
 		}
 		s.inTransaction = false
 
-		var event = &changeEvent{
-			Type: "Commit",
-			LSN:  msg.TransactionEndLSN,
+		var event = &sqlcapture.ChangeEvent{
+			Type:   "Commit",
+			Cursor: msg.TransactionEndLSN.String(),
 		}
 		return event, nil
 	}
@@ -269,7 +280,7 @@ func (s *replicationStream) decodeMessage(msg pglogrepl.Message) (*changeEvent, 
 	return nil, fmt.Errorf("unhandled message type %q: %v", msg.Type(), msg)
 }
 
-func (s *replicationStream) decodeChangeEvent(eventType string, tuple *pglogrepl.TupleData, relID uint32) (*changeEvent, error) {
+func (s *replicationStream) decodeChangeEvent(eventType string, tuple *pglogrepl.TupleData, relID uint32) (*sqlcapture.ChangeEvent, error) {
 	if !s.inTransaction {
 		return nil, fmt.Errorf("got %s message without a transaction in progress", eventType)
 	}
@@ -298,7 +309,7 @@ func (s *replicationStream) decodeChangeEvent(eventType string, tuple *pglogrepl
 		}
 	}
 
-	var event = &changeEvent{
+	var event = &sqlcapture.ChangeEvent{
 		Type:      eventType,
 		Namespace: rel.Namespace,
 		Table:     rel.RelationName,
@@ -363,7 +374,7 @@ func (s *replicationStream) receiveMessage(ctx context.Context) (pglogrepl.Messa
 	}
 }
 
-// CommitLSN informs the ReplicationStream that all messages up to the specified
+// Commit informs the ReplicationStream that all messages up to the specified
 // LSN [1] have been persisted, and that a future restart will never need to return
 // to older portions of the transaction log. This fact will be communicated to the
 // database in a periodic status update, whereupon the replication slot's "Restart
@@ -388,8 +399,13 @@ func (s *replicationStream) receiveMessage(ctx context.Context) (pglogrepl.Messa
 // Thus you shouldn't expect that a specific "Committed LSN" value will necessarily
 // advance the "Restart LSN" to the same point, but so long as you ignore the details
 // things will work out in the end.
-func (s *replicationStream) CommitLSN(lsn pglogrepl.LSN) {
+func (s *replicationStream) Commit(ctx context.Context, cursor string) error {
+	var lsn, err = pglogrepl.ParseLSN(cursor)
+	if err != nil {
+		return fmt.Errorf("error parsing commit cursor: %w", err)
+	}
 	atomic.StoreUint64(&s.commitLSN, uint64(lsn))
+	return nil
 }
 
 func (s *replicationStream) sendStandbyStatusUpdate(ctx context.Context) error {

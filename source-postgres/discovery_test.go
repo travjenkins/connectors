@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/estuary/connectors/sqlcapture"
 	"github.com/estuary/protocols/airbyte"
 )
 
@@ -14,7 +15,7 @@ func TestDiscoverySimple(t *testing.T) {
 
 	// Create the table (with deferred cleanup), perform discovery, and verify
 	// that the stream as discovered matches the golden snapshot.
-	var catalog, err = DiscoverCatalog(ctx, cfg)
+	var catalog, err = sqlcapture.DiscoverCatalog(ctx, &postgresDatabase{config: &cfg})
 	if err != nil {
 		t.Fatal(err)
 	}
