@@ -237,51 +237,101 @@ func commitCollection(ctx context.Context, t *transactor, b *binding) error {
 
 	totalUpserts := b.pendingUpserts.Len()
 	totalDeletions := b.pendingDeletions.Len()
+
 	defer logElapsedTime(time.Now(), fmt.Sprintf("commit completed: %d documents added %d documents deleted", totalUpserts, totalDeletions))
 
-	err := fanOut(ctx, b.pendingUpserts, b.concurrencyFactor(b.pendingUpserts.Len()), func(ctx context.Context, documents []json.RawMessage) error {
-		return t.client.AddDocuments(ctx, b.rocksetWorkspace(), b.rocksetCollection(), documents)
+	numWorkers := workerPoolSize(totalUpserts+totalDeletions, b.res.MaxBatchSize)
+	log.WithFields(log.Fields{"numWorkers": numWorkers}).Infof("booting workers")
+	workQueue, errors := newWorkerPool(ctx, numWorkers, func(ctx context.Context, j job, worker int) error {
+		log.WithFields(log.Fields{"numDocuments": len(j.data), "op": j.op, "worker": worker}).Infof("sending documents")
+		switch j.op {
+		case opDocumentUpsert:
+			return t.client.AddDocuments(ctx, b.rocksetWorkspace(), b.rocksetCollection(), j.data)
+		case opDocumentDelete:
+			return t.client.DeleteDocuments(ctx, b.rocksetWorkspace(), b.rocksetCollection(), j.data)
+		default:
+			return fmt.Errorf("unrecognized operation type: %v", j.op)
+		}
 	})
 
-	if err != nil {
-		return fmt.Errorf("committing upserts: %w", err)
-	}
+	go func() {
+		defer close(workQueue)
 
-	err = fanOut(ctx, b.pendingDeletions, b.concurrencyFactor(b.pendingDeletions.Len()), func(ctx context.Context, documents []json.RawMessage) error {
-		return t.client.DeleteDocuments(ctx, b.rocksetWorkspace(), b.rocksetCollection(), documents)
-	})
+		for i, batch := range b.pendingUpserts.SplitN(numWorkers) {
+			if len(batch) > 0 {
+				log.WithFields(log.Fields{"iteration": i, "batchSize": len(batch)}).Infof("pushing work to the queue: upsert")
+				workQueue <- job{op: opDocumentUpsert, data: batch}
+			}
+		}
+		for i, batch := range b.pendingDeletions.SplitN(numWorkers) {
+			if len(batch) > 0 {
+				log.WithFields(log.Fields{"iteration": i, "batchSize": len(batch)}).Infof("pushing work to the queue: delete")
+				workQueue <- job{op: opDocumentDelete, data: batch}
+			}
+		}
+	}()
+
+	log.Infof("commitCollection: waiting for completion")
+	err := errors.Wait()
+	b.pendingUpserts.Clear()
+	b.pendingDeletions.Clear()
+	log.Infof("commitCollection: done")
 
 	if err != nil {
-		return fmt.Errorf("committing deletions: %w", err)
+		return fmt.Errorf("committing documents to rockset: %w", err)
 	}
 
 	return nil
 }
 
-func fanOut(ctx context.Context, buf *DocumentBuffer, concurrencyFactor int, callback func(ctx context.Context, documents []json.RawMessage) error) error {
-	if buf.Len() == 0 {
-		return nil
-	}
+type job struct {
+	op   operation
+	data []json.RawMessage
+}
 
-	defer buf.Clear()
+func workerPoolSize(totalOperations int, maxBatchSize int) int {
+	const MAX_CONCURRENCY int = 20
+
+	return clamp(1, MAX_CONCURRENCY, totalOperations/maxBatchSize)
+}
+
+func newWorkerPool(ctx context.Context, poolSize int, doWork func(context.Context, job, int) error) (chan<- job, *errgroup.Group) {
+	jobs := make(chan job, poolSize)
 	group, ctx := errgroup.WithContext(ctx)
 
-	for i, documents := range buf.SplitN(concurrencyFactor) {
-		docs := documents
-		log.Infof("sending request %v: %v documents", i, len(docs))
-
+	for i := 0; i < poolSize; i++ {
+		i := i
 		group.Go(func() error {
-			return callback(ctx, docs)
+			// log.WithFields(log.Fields{"worker": i}).Infof("starting worker")
+			for job := range jobs {
+				// log.WithFields(log.Fields{"worker": i}).Infof("worker working")
+				if err := doWork(ctx, job, i); err != nil {
+					return err
+				}
+			}
+
+			return nil
 		})
 	}
-	if err := group.Wait(); err != nil {
-		return fmt.Errorf("request fan out: %w", err)
-	}
 
-	return nil
+	return jobs, group
 }
 
 func logElapsedTime(start time.Time, msg string) {
 	elapsed := time.Since(start)
 	log.Infof("%s,%f", msg, elapsed.Seconds())
+}
+
+func clamp(min int, max int, n int) int {
+	if max <= min {
+		panic("max must be larger than min")
+	}
+
+	if n > max {
+		return max
+	} else if n < min {
+		return min
+	} else {
+		return n
+	}
 }
