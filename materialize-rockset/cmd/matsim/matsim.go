@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	random "math/rand"
+	"net/http"
+	_ "net/http/pprof"
 
 	"github.com/estuary/connectors/flowsim/matsim"
 	"github.com/estuary/connectors/flowsim/testdata"
@@ -61,5 +63,8 @@ func fakeCdcEvent() func() testdata.TestData {
 
 // Matsim Main
 func main() {
+	go func() {
+		http.ListenAndServe("localhost:8080", nil)
+	}()
 	matsim.Run(context.Background(), connector.NewRocksetDriver(), fakeCdcEvent())
 }
